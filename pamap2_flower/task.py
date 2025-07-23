@@ -79,7 +79,7 @@ class CNNBiLSTMModel(nn.Module):
 # -------------------------------------------------
 # Split dataset and create DataLoaders
 # -------------------------------------------------
-def create_data_loaders(dataset, train_ratio=0.8, batch_size=32):
+def create_data_loaders(dataset, train_ratio=0.7, batch_size=32):
     """
     Splits dataset into train/test and creates DataLoaders.
     """
