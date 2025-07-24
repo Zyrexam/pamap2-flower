@@ -4,92 +4,104 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+
 # -------------------------------------------------
-# Gated Sensor Fusion Layer
+# Small CNN block used for each sensor stream
+# -------------------------------------------------
+class CNNBlock(nn.Module):
+    def __init__(self, input_dim, conv_channels=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(input_dim, conv_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(conv_channels),
+            nn.ReLU(),
+            nn.Conv1d(conv_channels, conv_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(conv_channels),
+            nn.ReLU()
+        )
+    def forward(self, x):
+        # x: (batch, time, features) → transpose to (batch, features, time)
+        x = x.transpose(1, 2)
+        x = self.net(x)
+        x = x.transpose(1, 2)  # back to (batch, time, conv_channels)
+        return x
+
+# -------------------------------------------------
+# Gated fusion layer
 # -------------------------------------------------
 class GatedFusion(nn.Module):
     """
-    Learns per-time-step gates to fuse features.
-    Input: (batch, time, features)
-    Output: gated features, same shape.
+    Fuse 3 sensor streams using learned gates.
     """
-    def __init__(self, input_dim, hidden_dim=32):
-        super(GatedFusion, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+    def __init__(self, conv_channels):
+        super().__init__()
+        self.gate_fc = nn.Sequential(
+            nn.Linear(3*conv_channels, 3*conv_channels),
             nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim),
-            nn.Sigmoid()
+            nn.Linear(3*conv_channels, 3),
+            nn.Softmax(dim=-1)
         )
 
-    def forward(self, x):
-        gates = self.fc(x)  # (batch, time, features)
-        return x * gates
+    def forward(self, x_hand, x_chest, x_ankle):
+        # concat features at each timestep
+        concat = torch.cat([x_hand, x_chest, x_ankle], dim=-1)  # shape (batch, time, 3*channels)
+        weights = self.gate_fc(concat)  # shape (batch, time, 3)
+        w1, w2, w3 = weights.chunk(3, dim=-1)  # each (batch, time, 1)
+        fused = w1 * x_hand + w2 * x_chest + w3 * x_ankle
+        return fused
 
 # -------------------------------------------------
-# CNN + BiLSTM Model with Gated Fusion and Dropout
+# Full model: 3 CNN streams → gated fusion → BiLSTM → classifier
 # -------------------------------------------------
 class CNNBiLSTMModel(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim=64, lstm_layers=1, dropout=0.5):
-        super(CNNBiLSTMModel, self).__init__()
+    def __init__(self, num_hand_features, num_chest_features, num_ankle_features,
+                 num_classes, conv_channels=64, hidden_dim=64, lstm_layers=1, dropout=0.5):
+        super().__init__()
+        self.cnn_hand = CNNBlock(num_hand_features, conv_channels)
+        self.cnn_chest = CNNBlock(num_chest_features, conv_channels)
+        self.cnn_ankle = CNNBlock(num_ankle_features, conv_channels)
 
-        # CNN over time dimension
-        self.conv = nn.Sequential(
-            nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU()
-        )
+        self.gate = GatedFusion(conv_channels)
 
-        # Gated fusion after CNN
-        self.gate = GatedFusion(64)
-
-        # BiLSTM
-        self.lstm = nn.LSTM(input_size=64, hidden_size=hidden_dim, num_layers=lstm_layers,
-                            bidirectional=True, batch_first=True)
+        self.lstm = nn.LSTM(input_size=conv_channels, hidden_size=hidden_dim,
+                            num_layers=lstm_layers, bidirectional=True, batch_first=True)
 
         self.dropout = nn.Dropout(dropout)
-
-        # Fully connected layer
         self.fc = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, x):
-        """
-        x: (batch, time, features)
-        """
-        x = x.transpose(1, 2)  # (batch, features, time)
-        x = self.conv(x)       # (batch, 64, time)
-        x = x.transpose(1, 2)  # (batch, time, 64)
+        # x: (batch, time, total_features=18)
+        x_hand = x[:, :, :6]
+        x_chest = x[:, :, 6:12]
+        x_ankle = x[:, :, 12:]
 
-        x = self.gate(x)       # gated fusion
+        out_hand = self.cnn_hand(x_hand)
+        out_chest = self.cnn_chest(x_chest)
+        out_ankle = self.cnn_ankle(x_ankle)
 
-        lstm_out, _ = self.lstm(x)  # (batch, time, hidden_dim*2)
+        fused = self.gate(out_hand, out_chest, out_ankle)
 
-        # mean pooling over time
-        x_pooled = lstm_out.mean(dim=1)
-
-        x_pooled = self.dropout(x_pooled)
-
-        logits = self.fc(x_pooled)
-
+        lstm_out, _ = self.lstm(fused)
+        pooled = lstm_out.mean(dim=1)
+        pooled = self.dropout(pooled)
+        logits = self.fc(pooled)
         return logits
 
 # -------------------------------------------------
 # Split dataset and create DataLoaders
 # -------------------------------------------------
-def create_data_loaders(dataset, train_ratio=0.7, batch_size=32):
-    """
-    Splits dataset into train/test and creates DataLoaders.
-    """
+def create_data_loaders(dataset, train_ratio=0.8, batch_size=32):
     train_size = int(len(dataset) * train_ratio)
     test_size = len(dataset) - train_size
     train_set, test_set = random_split(dataset, [train_size, test_size])
+    return (
+        DataLoader(train_set, batch_size=batch_size, shuffle=True),
+        DataLoader(test_set, batch_size=batch_size, shuffle=False)
+    )
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
-    return train_loader, test_loader
 
 # -------------------------------------------------
 # Training function

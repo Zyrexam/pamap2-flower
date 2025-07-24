@@ -25,7 +25,7 @@ serverapp = "pamap2_flower.server_app:app"
 clientapp = "pamap2_flower.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 3
+num-server-rounds = 5
 fraction-fit = 0.5
 local-epochs = 1
 
